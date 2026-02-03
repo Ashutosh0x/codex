@@ -437,7 +437,7 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
     let config = Arc::new(config);
 
     let conversation_id = ThreadId::new();
-    let auth_mode = AuthMode::Chatgpt;
+    let auth_mode = TelemetryAuthMode::Chatgpt;
     let session_source =
         SessionSource::SubAgent(SubAgentSource::Other("turn-metadata-e2e".to_string()));
     let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
