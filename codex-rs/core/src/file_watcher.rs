@@ -130,7 +130,6 @@ impl FileWatcher {
     }
 
     pub(crate) fn register_config(&self, config: &Config) {
-        self.register_skills_root(config.codex_home.join("skills"));
         let roots =
             skill_roots_from_layer_stack_with_agents(&config.config_layer_stack, &config.cwd);
         for root in roots {
