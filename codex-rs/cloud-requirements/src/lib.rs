@@ -14,14 +14,17 @@ use codex_core::AuthManager;
 use codex_core::auth::CodexAuth;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::ConfigRequirementsToml;
+use codex_core::util::backoff;
 use codex_protocol::account::PlanType;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::time::sleep;
 use tokio::time::timeout;
 
 /// This blocks codex startup, so must be short.
-const CLOUD_REQUIREMENTS_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOUD_REQUIREMENTS_TIMEOUT: Duration = Duration::from_secs(15);
+const CLOUD_REQUIREMENTS_MAX_ATTEMPTS: usize = 5;
 
 #[async_trait]
 trait RequirementsFetcher: Send + Sync {
@@ -129,11 +132,40 @@ impl CloudRequirementsService {
             return None;
         }
 
-        let contents = self.fetcher.fetch_requirements(&auth).await?;
-        parse_cloud_requirements(&contents)
-            .inspect_err(|err| tracing::warn!(error = %err, "Failed to parse cloud requirements"))
-            .ok()
-            .flatten()
+        self.fetch_with_retries(&auth).await
+    }
+
+    async fn fetch_with_retries(&self, auth: &CodexAuth) -> Option<ConfigRequirementsToml> {
+        for attempt in 1..=CLOUD_REQUIREMENTS_MAX_ATTEMPTS {
+            let Some(contents) = self.fetcher.fetch_requirements(auth).await else {
+                if attempt < CLOUD_REQUIREMENTS_MAX_ATTEMPTS {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = CLOUD_REQUIREMENTS_MAX_ATTEMPTS,
+                        "Failed to fetch cloud requirements; retrying"
+                    );
+                    sleep(backoff(attempt as u64)).await;
+                }
+                continue;
+            };
+
+            match parse_cloud_requirements(&contents) {
+                Ok(requirements) => return requirements,
+                Err(err) => {
+                    tracing::warn!(error = %err, "Failed to parse cloud requirements");
+                    if attempt < CLOUD_REQUIREMENTS_MAX_ATTEMPTS {
+                        tracing::warn!(
+                            attempt,
+                            max_attempts = CLOUD_REQUIREMENTS_MAX_ATTEMPTS,
+                            "Retrying cloud requirements fetch after parse failure"
+                        );
+                        sleep(backoff(attempt as u64)).await;
+                    }
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -179,8 +211,11 @@ mod tests {
     use codex_protocol::protocol::AskForApproval;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::collections::VecDeque;
     use std::future::pending;
     use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use tempfile::tempdir;
 
     fn write_auth_json(codex_home: &Path, value: serde_json::Value) -> std::io::Result<()> {
@@ -259,6 +294,29 @@ mod tests {
         async fn fetch_requirements(&self, _auth: &CodexAuth) -> Option<String> {
             pending::<()>().await;
             None
+        }
+    }
+
+    struct SequenceFetcher {
+        responses: tokio::sync::Mutex<VecDeque<Option<String>>>,
+        request_count: AtomicUsize,
+    }
+
+    impl SequenceFetcher {
+        fn new(responses: Vec<Option<String>>) -> Self {
+            Self {
+                responses: tokio::sync::Mutex::new(VecDeque::from(responses)),
+                request_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RequirementsFetcher for SequenceFetcher {
+        async fn fetch_requirements(&self, _auth: &CodexAuth) -> Option<String> {
+            self.request_count.fetch_add(1, Ordering::SeqCst);
+            let mut responses = self.responses.lock().await;
+            responses.pop_front().flatten()
         }
     }
 
@@ -359,5 +417,58 @@ mod tests {
 
         let result = handle.await.expect("cloud requirements task");
         assert!(result.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_cloud_requirements_retries_until_success() {
+        let fetcher = Arc::new(SequenceFetcher::new(vec![
+            None,
+            Some("allowed_approval_policies = [\"never\"]".to_string()),
+        ]));
+        let service = CloudRequirementsService::new(
+            auth_manager_with_plan("business"),
+            fetcher.clone(),
+            CLOUD_REQUIREMENTS_TIMEOUT,
+        );
+
+        let handle = tokio::spawn(async move { service.fetch().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert_eq!(
+            handle.await.expect("cloud requirements task"),
+            Some(ConfigRequirementsToml {
+                allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_sandbox_modes: None,
+                mcp_servers: None,
+                rules: None,
+                enforce_residency: None,
+            })
+        );
+        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_cloud_requirements_stops_after_max_retries() {
+        let fetcher = Arc::new(SequenceFetcher::new(vec![
+            None;
+            CLOUD_REQUIREMENTS_MAX_ATTEMPTS
+        ]));
+        let service = CloudRequirementsService::new(
+            auth_manager_with_plan("enterprise"),
+            fetcher.clone(),
+            CLOUD_REQUIREMENTS_TIMEOUT,
+        );
+
+        let handle = tokio::spawn(async move { service.fetch().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert!(handle.await.expect("cloud requirements task").is_none());
+        assert_eq!(
+            fetcher.request_count.load(Ordering::SeqCst),
+            CLOUD_REQUIREMENTS_MAX_ATTEMPTS
+        );
     }
 }
