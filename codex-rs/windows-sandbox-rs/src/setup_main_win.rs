@@ -437,10 +437,92 @@ fn real_main() -> Result<()> {
 }
 
 fn run_setup(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<()> {
-    match payload.mode {
-        SetupMode::ReadAclsOnly => run_read_acl_only(payload, log),
-        SetupMode::Full => run_setup_full(payload, log, sbx_dir),
+    if payload.refresh_only {
+        // The orchestrator already holds the SETUP_REFRESH_MUTEX_NAME while spawning us.
+        // We skip acquiring it here to allow the refresh to proceed.
+        run_refresh_best_effort(payload, log)
+    } else {
+        match payload.mode {
+            SetupMode::ReadAclsOnly => run_read_acl_only(payload, log),
+            SetupMode::Full => run_setup_full(payload, log, sbx_dir),
+        }
     }
+}
+
+fn run_refresh_best_effort(payload: &Payload, log: &mut File) -> Result<()> {
+    log_line(log, "setup refresh (best-effort) starting")?;
+    let sandbox_group_sid = resolve_sandbox_users_group_sid()?;
+    let sandbox_group_psid = sid_bytes_to_psid(&sandbox_group_sid)?;
+    
+    let users_sid = unsafe { codex_windows_sandbox::builtin_users_sid()? };
+    let users_psid = sid_bytes_to_psid(&users_sid)?;
+    let auth_sid = unsafe { codex_windows_sandbox::authenticated_users_sid()? };
+    let auth_psid = sid_bytes_to_psid(&auth_sid)?;
+    let everyone_sid = unsafe { codex_windows_sandbox::world_sid()? };
+    let everyone_psid = sid_bytes_to_psid(&everyone_sid)?;
+    let rx_psids = vec![users_psid, auth_psid, everyone_psid];
+    
+    let subjects = ReadAclSubjects {
+        sandbox_group_psid,
+        rx_psids: &rx_psids,
+    };
+
+    let mut refresh_errors: Vec<String> = Vec::new();
+    
+    // 1) Refresh Read ACLs for read_roots
+    let _ = apply_read_acls(
+        &payload.read_roots,
+        &subjects,
+        log,
+        &mut refresh_errors,
+        FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        "read",
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+    );
+
+    // 2) Refresh Write ACLs for write_roots (non-recursive in refresh mode)
+    let caps = load_or_create_cap_sids(&payload.codex_home).ok();
+    let cap_psid = caps.as_ref().and_then(|c| unsafe { convert_string_sid_to_sid(&c.workspace) });
+    let workspace_sid_str = workspace_cap_sid_for_cwd(&payload.codex_home, &payload.command_cwd).ok();
+    let workspace_psid = workspace_sid_str.as_ref().and_then(|s| unsafe { convert_string_sid_to_sid(s) });
+    
+    let canonical_command_cwd = canonicalize_path(&payload.command_cwd);
+    let write_mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
+
+    if !sandbox_group_psid.is_null() {
+        for root in &payload.write_roots {
+            if !root.exists() { continue; }
+            let is_command_cwd = is_command_cwd_root(root, &canonical_command_cwd);
+            let current_psid = if is_command_cwd { workspace_psid.or(cap_psid) } else { cap_psid };
+
+            let mut psids_to_check = vec![sandbox_group_psid];
+            if let Some(p) = current_psid { psids_to_check.push(p); }
+
+            let has_all = match unsafe { path_mask_allows(root, &psids_to_check, write_mask, true) } {
+                Ok(has) => has,
+                Err(_) => false,
+            };
+
+            if !has_all {
+                log_line(log, &format!("refreshing write ACE for {}", root.display()))?;
+                let mut psids_to_grant = vec![sandbox_group_psid];
+                if let Some(p) = current_psid { psids_to_grant.push(p); }
+                let _ = unsafe { ensure_allow_write_aces(root, &psids_to_grant, false) };
+            }
+        }
+    }
+
+    unsafe {
+        if !sandbox_group_psid.is_null() { LocalFree(sandbox_group_psid as HLOCAL); }
+        if !users_psid.is_null() { LocalFree(users_psid as HLOCAL); }
+        if !auth_psid.is_null() { LocalFree(auth_psid as HLOCAL); }
+        if !everyone_psid.is_null() { LocalFree(everyone_psid as HLOCAL); }
+        if let Some(p) = cap_psid { LocalFree(p as HLOCAL); }
+        if let Some(p) = workspace_psid { LocalFree(p as HLOCAL); }
+    }
+
+    log_line(log, "setup refresh completed")?;
+    Ok(())
 }
 
 fn run_read_acl_only(payload: &Payload, log: &mut File) -> Result<()> {
@@ -572,7 +654,10 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
     };
     let mut refresh_errors: Vec<String> = Vec::new();
     if !refresh_only {
-        let firewall_result = firewall::ensure_offline_outbound_block(&offline_sid_str, log);
+        let firewall_result = firewall::ensure_offline_outbound_block(
+            &[offline_sid_str, caps.offline.clone()],
+            log,
+        );
         if let Err(err) = firewall_result {
             if extract_setup_failure(&err).is_some() {
                 return Err(err);

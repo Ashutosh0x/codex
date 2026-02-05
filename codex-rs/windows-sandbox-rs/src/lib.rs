@@ -263,21 +263,79 @@ mod windows_impl {
             match &policy {
                 SandboxPolicy::ReadOnly => {
                     let psid = convert_string_sid_to_sid(&caps.readonly).unwrap();
-                    let (h, _) = super::token::create_readonly_token_with_cap(psid)?;
+                    let sandbox_group_sid_vec =
+                        super::token::resolve_sid("CodexSandboxUsers").unwrap_or_default();
+                    let psid_group = if !sandbox_group_sid_vec.is_empty() {
+                        convert_string_sid_to_sid(
+                            &string_from_sid_bytes(&sandbox_group_sid_vec).unwrap(),
+                        )
+                    } else {
+                        None
+                    };
+                    let mut caps_to_add = vec![psid];
+                    if let Some(g) = psid_group {
+                        caps_to_add.push(g);
+                    }
+                    if apply_network_block {
+                        if let Some(psid_offline) = convert_string_sid_to_sid(&caps.offline) {
+                            caps_to_add.push(psid_offline);
+                        }
+                    }
+                    let h = super::token::create_readonly_token_with_caps_from_base(
+                        caps_to_add.as_slice(),
+                    )?;
+                    // Clean up SIDs we allocated
+                    if let Some(g) = psid_group {
+                        windows_sys::Win32::Foundation::LocalFree(g as _);
+                    }
+                    if apply_network_block {
+                        // Free the offline PSID which is the last one added.
+                        if let Some(p) = caps_to_add.last() {
+                            if *p != psid {
+                                windows_sys::Win32::Foundation::LocalFree(*p as _);
+                            }
+                        }
+                    }
                     (h, psid, None)
                 }
                 SandboxPolicy::WorkspaceWrite { .. } => {
-                    let psid_generic = convert_string_sid_to_sid(&caps.workspace).unwrap();
+                    let psid_raw = convert_string_sid_to_sid(&caps.workspace).unwrap();
                     let ws_sid = workspace_cap_sid_for_cwd(codex_home, cwd)?;
-                    let psid_workspace = convert_string_sid_to_sid(&ws_sid).unwrap();
+                    let psid_workspace_raw = convert_string_sid_to_sid(&ws_sid).unwrap();
+                    let sandbox_group_sid_vec =
+                        super::token::resolve_sid("CodexSandboxUsers").unwrap_or_default();
+                    let psid_group = if !sandbox_group_sid_vec.is_empty() {
+                        convert_string_sid_to_sid(
+                            &string_from_sid_bytes(&sandbox_group_sid_vec).unwrap(),
+                        )
+                    } else {
+                        None
+                    };
+                    let mut caps_to_add = vec![psid_raw, psid_workspace_raw];
+                    if let Some(g) = psid_group {
+                        caps_to_add.push(g);
+                    }
+                    if apply_network_block {
+                        if let Some(psid_offline) = convert_string_sid_to_sid(&caps.offline) {
+                            caps_to_add.push(psid_offline);
+                        }
+                    }
                     let base = super::token::get_current_token_for_restriction()?;
-                    let h_res = create_workspace_write_token_with_caps_from(
-                        base,
-                        &[psid_generic, psid_workspace],
-                    );
+                    let h_res = create_workspace_write_token_with_caps_from(base, &caps_to_add);
+                    if let Some(g) = psid_group {
+                        windows_sys::Win32::Foundation::LocalFree(g as _);
+                    }
+                    if apply_network_block {
+                        // Free the offline PSID which is the last one added.
+                        if let Some(p) = caps_to_add.last() {
+                            if *p != psid_raw && *p != psid_workspace_raw {
+                                windows_sys::Win32::Foundation::LocalFree(*p as _);
+                            }
+                        }
+                    }
                     windows_sys::Win32::Foundation::CloseHandle(base);
                     let h = h_res?;
-                    (h, psid_generic, Some(psid_workspace))
+                    (h, psid_raw, Some(psid_workspace_raw))
                 }
                 SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
                     unreachable!("DangerFullAccess handled above")

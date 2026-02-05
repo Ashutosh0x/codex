@@ -239,7 +239,8 @@ mod windows_impl {
             anyhow::bail!("DangerFullAccess and ExternalSandbox are not supported for sandboxing")
         }
         let caps = load_or_create_cap_sids(codex_home)?;
-        let (psid_to_use, cap_sids) = match &policy {
+        let apply_network_block = !policy.has_full_network_access();
+        let (psid_to_use, mut cap_sids) = match &policy {
             SandboxPolicy::ReadOnly => (
                 unsafe { convert_string_sid_to_sid(&caps.readonly).unwrap() },
                 vec![caps.readonly.clone()],
@@ -255,6 +256,10 @@ mod windows_impl {
                 unreachable!("DangerFullAccess handled above")
             }
         };
+
+        if apply_network_block {
+            cap_sids.push(caps.offline.clone());
+        }
 
         let AllowDenyPaths { allow: _, deny: _ } =
             compute_allow_paths(&policy, sandbox_policy_cwd, &current_dir, &env_map);

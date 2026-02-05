@@ -15,6 +15,8 @@ use crate::path_normalization::canonical_path_key;
 pub struct CapSids {
     pub workspace: String,
     pub readonly: String,
+    #[serde(default)]
+    pub offline: String,
     /// Per-workspace capability SIDs keyed by canonicalized CWD string.
     ///
     /// This is used to isolate workspaces from other workspace sandbox writes and to
@@ -53,13 +55,18 @@ pub fn load_or_create_cap_sids(codex_home: &Path) -> Result<CapSids> {
             .with_context(|| format!("read cap sid file {}", path.display()))?;
         let t = txt.trim();
         if t.starts_with('{') && t.ends_with('}') {
-            if let Ok(obj) = serde_json::from_str::<CapSids>(t) {
+            if let Ok(mut obj) = serde_json::from_str::<CapSids>(t) {
+                if obj.offline.is_empty() {
+                    obj.offline = make_random_cap_sid_string();
+                    persist_caps(&path, &obj)?;
+                }
                 return Ok(obj);
             }
         } else if !t.is_empty() {
             let caps = CapSids {
                 workspace: t.to_string(),
                 readonly: make_random_cap_sid_string(),
+                offline: make_random_cap_sid_string(),
                 workspace_by_cwd: HashMap::new(),
             };
             persist_caps(&path, &caps)?;
@@ -69,6 +76,7 @@ pub fn load_or_create_cap_sids(codex_home: &Path) -> Result<CapSids> {
     let caps = CapSids {
         workspace: make_random_cap_sid_string(),
         readonly: make_random_cap_sid_string(),
+        offline: make_random_cap_sid_string(),
         workspace_by_cwd: HashMap::new(),
     };
     persist_caps(&path, &caps)?;

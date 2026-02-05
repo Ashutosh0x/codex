@@ -31,8 +31,15 @@ const OFFLINE_BLOCK_RULE_NAME: &str = "codex_sandbox_offline_block_outbound";
 // Friendly text shown in the firewall UI.
 const OFFLINE_BLOCK_RULE_FRIENDLY: &str = "Codex Sandbox Offline - Block Outbound";
 
-pub fn ensure_offline_outbound_block(offline_sid: &str, log: &mut File) -> Result<()> {
-    let local_user_spec = format!("O:LSD:(A;;CC;;;{offline_sid})");
+pub fn ensure_offline_outbound_block(offline_sids: &[String], log: &mut File) -> Result<()> {
+    if offline_sids.is_empty() {
+        return Ok(());
+    }
+    let mut aces = String::new();
+    for sid in offline_sids {
+        aces.push_str(&format!("(A;;CC;;;{sid})"));
+    }
+    let local_user_spec = format!("O:LSD:{aces}");
 
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if hr.is_err() {
@@ -58,14 +65,14 @@ pub fn ensure_offline_outbound_block(offline_sid: &str, log: &mut File) -> Resul
                 ))
             })?;
 
-            // Block all outbound IP protocols for this user.
+            // Block all outbound IP protocols for these users/SIDs.
             ensure_block_rule(
                 &rules,
                 OFFLINE_BLOCK_RULE_NAME,
                 OFFLINE_BLOCK_RULE_FRIENDLY,
                 NET_FW_IP_PROTOCOL_ANY.0,
                 &local_user_spec,
-                offline_sid,
+                offline_sids,
                 log,
             )?;
             Ok(())
@@ -84,7 +91,7 @@ fn ensure_block_rule(
     friendly_desc: &str,
     protocol: i32,
     local_user_spec: &str,
-    offline_sid: &str,
+    offline_sids: &[String],
     log: &mut File,
 ) -> Result<()> {
     let name = BSTR::from(internal_name);
@@ -117,7 +124,7 @@ fn ensure_block_rule(
                 friendly_desc,
                 protocol,
                 local_user_spec,
-                offline_sid,
+                offline_sids,
             )?;
             unsafe { rules.Add(&new_rule) }.map_err(|err| {
                 anyhow::Error::new(SetupFailure::new(
@@ -130,7 +137,7 @@ fn ensure_block_rule(
     };
 
     // Always re-apply fields to keep the setup idempotent.
-    configure_rule(&rule, friendly_desc, protocol, local_user_spec, offline_sid)?;
+    configure_rule(&rule, friendly_desc, protocol, local_user_spec, offline_sids)?;
 
     log_line(
         log,
@@ -146,7 +153,7 @@ fn configure_rule(
     friendly_desc: &str,
     protocol: i32,
     local_user_spec: &str,
-    offline_sid: &str,
+    offline_sids: &[String],
 ) -> Result<()> {
     unsafe {
         rule.SetDescription(&BSTR::from(friendly_desc))
@@ -203,13 +210,15 @@ fn configure_rule(
         ))
     })?;
     let actual_str = actual.to_string();
-    if !actual_str.contains(offline_sid) {
-        return Err(anyhow::Error::new(SetupFailure::new(
-            SetupErrorCode::HelperFirewallRuleVerifyFailed,
-            format!(
-                "offline firewall rule user scope mismatch: expected SID {offline_sid}, got {actual_str}"
-            ),
-        )));
+    for sid in offline_sids {
+        if !actual_str.contains(sid) {
+            return Err(anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperFirewallRuleVerifyFailed,
+                format!(
+                    "offline firewall rule user scope mismatch: expected SID {sid} to be in {actual_str}"
+                ),
+            )));
+        }
     }
     Ok(())
 }
